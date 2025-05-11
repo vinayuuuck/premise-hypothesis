@@ -1,8 +1,8 @@
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
 import tensorflow as tf
-import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from datasets import load_dataset
 
 
 # Load GloVe embeddings
@@ -11,8 +11,8 @@ def load_glove_embeddings(glove_file):
     with open(glove_file, "r", encoding="utf-8") as f:
         for line in f:
             values = line.split()
-            word = values[0]
-            vector = np.array(values[1:], dtype="float32")
+            word = "".join(values[:-300])
+            vector = np.asarray(values[-300:], dtype="float32")
             embeddings[word] = vector
     return embeddings
 
@@ -37,39 +37,45 @@ def sentence_embedding(sentence, embeddings_index):
     return (sentence_embedding + 1) / (len(words) + 1)
 
 
-def build_training_data(data_path: str = "./data/snli_1.0/snli_1.0_train.jsonl"):
-    data = pd.read_json(data_path, lines=True)
-    # remove all rows where gold_label is '-'
-    data = data[data["gold_label"] != "-"]
-    sentences1 = data["sentence1"].values
-    sentences2 = data["sentence2"].values
-    labels = data["gold_label"].values
+def sentence_embedding_pooling(sentence, embeddings_index, embedding_dim):
+    words = sentence.split()
+    vectors = [
+        embeddings_index.get(w.lower()) for w in words if w.lower() in embeddings_index
+    ]
+    if not vectors:
+        print(f"Warning: No embeddings found for words in sentence: {sentence}")
+        fallback = np.full(
+            (embedding_dim,), fill_value=1.0 / (embedding_dim + 1), dtype="float32"
+        )
+        return fallback, fallback
+    stacked = np.stack(vectors, axis=0)
+    avg_vec = np.mean(stacked, axis=0)
+    max_vec = np.max(stacked, axis=0)
 
-    # Print rows with missing values or NaN
-    missing_rows = data[data.isnull().any(axis=1)]
-    if not missing_rows.empty:
-        print("Rows with missing values:")
-        print(missing_rows)
-    else:
-        print("No missing values found.")
+    return avg_vec, max_vec
 
-    # Preprocess the labels
-    label_map = {"entailment": 0, "contradiction": 1, "neutral": 2}
-    labels = np.array([label_map[label] for label in labels])
 
-    # Split the data into training and validation sets
-    X_train, X_val, y_train, y_val = train_test_split(
-        list(zip(sentences1, sentences2)), labels, test_size=0.2, random_state=42
+def combine(premise, hypothesis, embeddings_index, embedding_dim):
+    premise_avg, premise_max = sentence_embedding_pooling(
+        premise, embeddings_index, embedding_dim
     )
+    hypothesis_avg, hypothesis_max = sentence_embedding_pooling(
+        hypothesis, embeddings_index, embedding_dim
+    )
+    abs_diff = np.abs(premise_avg - hypothesis_avg)
+    prod = premise_avg * hypothesis_avg
 
-    return X_train, X_val, y_train, y_val
+    return np.concatenate(
+        [premise_avg, premise_max, hypothesis_avg, hypothesis_max, abs_diff, prod]
+    )
 
 
 def train_model():
     # Load GloVe embeddings
-    glove_file = "./data/glove.6B//glove.6B.300d.txt"
+    glove_file = "./data/glove.840B.300d.txt"
     embeddings_index = load_glove_embeddings(glove_file)
     embedding_dim = 300
+    print(f"Loaded {len(embeddings_index)} word vectors.")
 
     # Create a tokenizer
     tokenizer = tf.keras.preprocessing.text.Tokenizer()
@@ -78,27 +84,25 @@ def train_model():
     print(f"Found {len(word_index)} unique tokens.")
 
     # Build the training data
-    X_train, X_val, y_train, y_val = build_training_data()
-    print("Training data built.")
+    snli = load_dataset("snli")
+    snli = snli.filter(lambda x: x["label"] != "-1")
+    X_train = snli["train"]
+    X_val = snli["validation"]
+    y_train = X_train["label"]
+    y_val = X_val["label"]
 
-    premise_embeddings = [
-        sentence_embedding(s[0].lower(), embeddings_index) for s in X_train
-    ]
-    hypothesis_embeddings = [
-        sentence_embedding(s[1].lower(), embeddings_index) for s in X_train
-    ]
-    X_train_embeddings = np.hstack(
-        (np.array(premise_embeddings), np.array(hypothesis_embeddings))
+    X_train_embeddings = np.array(
+        [
+            combine(s["premise"], s["hypothesis"], embeddings_index, embedding_dim)
+            for s in X_train
+        ]
     )
 
-    premise_embeddings_val = [
-        sentence_embedding(s[0].lower(), embeddings_index) for s in X_val
-    ]
-    hypothesis_embeddings_val = [
-        sentence_embedding(s[1].lower(), embeddings_index) for s in X_val
-    ]
-    X_val_embeddings = np.hstack(
-        (np.array(premise_embeddings_val), np.array(hypothesis_embeddings_val))
+    X_val_embeddings = np.array(
+        [
+            combine(s["premise"], s["hypothesis"], embeddings_index, embedding_dim)
+            for s in X_val
+        ]
     )
 
     # Convert labels to one-hot encoding
@@ -108,27 +112,26 @@ def train_model():
     print("Labels converted to one-hot encoding.")
 
     # Define the model
-    model = tf.keras.Sequential(
-        [
-            tf.keras.layers.Input(
-                shape=(600,)
-            ),  # input shape is twice the GloVe embedding dimension for premise and hypothesis
-            tf.keras.layers.Dense(512, activation="relu", input_shape=(embedding_dim,)),
-            # tf.keras.layers.Dropout(0.5),
-            tf.keras.layers.Dense(256, activation="relu"),
-            # tf.keras.layers.Dropout(0.5),
-            tf.keras.layers.Dense(num_classes, activation="softmax"),
-        ]
-    )
-    print("Model defined.")
+    inputs = tf.keras.layers.Input(shape=(X_train_embeddings.shape[1],))
+    x = tf.keras.layers.Dense(
+        512,
+        activation="relu",
+    )(inputs)
+    # x = tf.keras.layers.Dropout(0.5)(x)
+    x = tf.keras.layers.Dense(
+        256,
+        activation="relu",
+    )(x)
+    # x = tf.keras.layers.Dropout(0.5)(x)
+    outputs = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
 
-    # Compile the model
+    # Create the model
+    model = tf.keras.Model(inputs=inputs, outputs=outputs)
     model.compile(
         optimizer=tf.keras.optimizers.Adam(),
         loss="categorical_crossentropy",
         metrics=["accuracy"],
     )
-    print("Model compiled.")
 
     # Train the model
     history = model.fit(
@@ -140,6 +143,20 @@ def train_model():
     )
     print("Model trained.")
 
+    # Evaluate the model
+    test_embeddings = np.array(
+        [
+            combine(s["premise"], s["hypothesis"], embeddings_index, embedding_dim)
+            for s in snli["test"]
+        ]
+    )
+    test_labels = snli["test"]["label"]
+    test_labels_one_hot = tf.keras.utils.to_categorical(test_labels, num_classes)
+
+    test_loss, test_accuracy = model.evaluate(test_embeddings, test_labels_one_hot)
+    print(f"Test loss: {test_loss}")
+    print(f"Test accuracy: {test_accuracy}")
+
     # Save the model
     model.save("./data/models/sentence_model.h5")
     print("Model saved.")
@@ -148,18 +165,7 @@ def train_model():
 
 
 def main():
-    # Train the model
     model, history = train_model()
-
-    # Plot training & validation accuracy values
-    # plt.plot(history.history["accuracy"])
-    # plt.plot(history.history["val_accuracy"])
-    # plt.title("Model accuracy")
-    # plt.ylabel("Accuracy")
-    # plt.xlabel("Epoch")
-    # plt.legend(["Train", "Validation"], loc="upper left")
-    # plt.show()
-    # print("Training and validation accuracy plotted.")
 
 
 if __name__ == "__main__":

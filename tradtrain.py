@@ -1,133 +1,129 @@
-import xgboost
 import time
-import pandas as pd
 import numpy as np
 import scipy.sparse
+
+from datasets import load_dataset
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GridSearchCV
-from sklearn.ensemble import (
-    VotingClassifier,
-    RandomForestClassifier,
-    GradientBoostingClassifier,
-)
-from sklearn.metrics import accuracy_score
+from sklearn.ensemble import VotingClassifier, RandomForestClassifier
 from xgboost import XGBClassifier
+from sklearn.metrics import accuracy_score
 from joblib import dump, load
 
 
-def build_train_data(trainfile: str = "./data/snli_1.0/snli_1.0_train.jsonl"):
-    train_data = pd.read_json(trainfile, lines=True)
-    # Remove all rows where gold_label is '-'
-    train_data = train_data[train_data["gold_label"] != "-"]
-    training_corpus = [
-        f"{sentence1} {sentence2}"
-        for sentence1, sentence2 in zip(
-            train_data["sentence1"], train_data["sentence2"]
-        )
-    ]
-    vectorizer = TfidfVectorizer()
-    vectorizer.fit(training_corpus)
-    tfidf_premise = vectorizer.transform(train_data["sentence1"].values.astype("U"))
-    tfidf_hypothesis = vectorizer.transform(train_data["sentence2"].values.astype("U"))
-
-    train_features = scipy.sparse.hstack((tfidf_premise, tfidf_hypothesis))
-    train_labels = train_data["gold_label"].values
-    # Preprocess the labels
-    label_map = {"entailment": 0, "contradiction": 1, "neutral": 2}
-    train_labels = np.array([label_map[label] for label in train_labels])
-
-    missing_rows = train_data[train_data.isnull().any(axis=1)]
-    if not missing_rows.empty:
-        print("Rows with missing values:")
-        print(missing_rows)
-    else:
-        print("No missing values found.")
-
-    return train_features, train_labels, vectorizer
+# 1. Load SNLI splits
+def load_snli_splits():
+    snli = load_dataset("snli")
+    snli = snli.filter(lambda ex: ex["label"] != -1)
+    return snli["train"], snli["validation"], snli["test"]
 
 
-def build_test_data(
-    vectorizer: TfidfVectorizer, testfile: str = "./data/snli_1.0/snli_1.0_test.jsonl"
-):
-    train_data = pd.read_json(testfile, lines=True)
-    # Remove all rows where gold_label is '-'
-    train_data = train_data[train_data["gold_label"] != "-"]
-    tfidf_premise = vectorizer.transform(train_data["sentence1"].values.astype("U"))
-    tfidf_hypothesis = vectorizer.transform(train_data["sentence2"].values.astype("U"))
+# 2. Build TF–IDF vectorizer & features
+def build_vectorizer_and_features(train_ds):
+    corpus = [f"{p} {h}" for p, h in zip(train_ds["premise"], train_ds["hypothesis"])]
+    vec = TfidfVectorizer()
+    vec.fit(corpus)
 
-    test_features = scipy.sparse.hstack((tfidf_premise, tfidf_hypothesis))
-    test_labels = train_data["gold_label"].values
-
-    # Preprocess the labels
-    label_map = {"entailment": 0, "contradiction": 1, "neutral": 2}
-    test_labels = np.array([label_map[label] for label in test_labels])
-    return test_features, test_labels
+    tfidf_p = vec.transform(train_ds["premise"])
+    tfidf_h = vec.transform(train_ds["hypothesis"])
+    X = scipy.sparse.hstack((tfidf_p, tfidf_h))
+    y = np.array(train_ds["label"])
+    return vec, X, y
 
 
-def build_logistic_regression_model(train_features, train_labels):
-    param_grid = {
-        "C": [0.1, 1.0, 10.0],
-        "solver": ["lbfgs", "newton-cg", "saga"],
-    }
-    grid_search = GridSearchCV(
-        LogisticRegression(max_iter=100000),
+# 3. Transform any split
+def transform_features(ds, vec):
+    tfidf_p = vec.transform(ds["premise"])
+    tfidf_h = vec.transform(ds["hypothesis"])
+    X = scipy.sparse.hstack((tfidf_p, tfidf_h))
+    y = np.array(ds["label"])
+    return X, y
+
+
+# 4. Model builders
+def build_logistic(X, y):
+    param_grid = {"C": [0.1, 1.0, 10.0], "solver": ["lbfgs", "newton-cg", "saga"]}
+    grid = GridSearchCV(
+        LogisticRegression(max_iter=100_000),
         param_grid,
         cv=5,
         scoring="accuracy",
         n_jobs=-1,
-        verbose=4,
+        verbose=2,
     )
-    grid_search.fit(train_features, train_labels)
-    best_model = grid_search.best_estimator_
-    print("Best parameters for Logistic Regression:", grid_search.best_params_)
-    return best_model
+    grid.fit(X, y)
+    print("LR best params:", grid.best_params_)
+    return grid.best_estimator_
 
 
-def build_random_forest_model(train_features, train_labels):
-    model = RandomForestClassifier(
+def build_rf(X, y):
+    rf = RandomForestClassifier(
         n_estimators=100, max_depth=5, random_state=42, n_jobs=-1
     )
-    model.fit(train_features, train_labels)
-    return model
+    rf.fit(X, y)
+    return rf
 
 
-def build_gradient_boosting_model(train_features, train_labels):
-    model = XGBClassifier(
+def build_xgb(X, y):
+    xgb = XGBClassifier(
         n_estimators=100,
         learning_rate=0.1,
         max_depth=5,
         random_state=42,
         n_jobs=-1,
+        use_label_encoder=False,
+        eval_metric="mlogloss",
     )
-    model.fit(train_features, train_labels)
-    return model
+    xgb.fit(X, y)
+    return xgb
 
 
-# Testing
-def test_model(model, test_features, test_labels):
-    start_time = time.time()
-    predictions = model.predict(test_features)
-    accuracy = accuracy_score(test_labels, predictions)
-    end_time = time.time()
-    print(f"Accuracy: {accuracy:.4f}")
-    print(f"Time taken: {end_time - start_time:.2f} seconds")
-    return accuracy
+# 5. Evaluation helper
+def test_model(name, model, X, y):
+    start = time.time()
+    preds = model.predict(X)
+    acc = accuracy_score(y, preds)
+    print(f"{name} accuracy: {acc:.4f} ({time.time()-start:.2f}s)")
+    return acc
 
 
 def main():
-    # Load training data
-    train_features, train_labels, vectorizer = build_train_data()
-    test_features, test_labels = build_test_data(vectorizer)
+    # Load data
+    train_ds, val_ds, test_ds = load_snli_splits()
 
-    # Train models
-    logistic_model = build_logistic_regression_model(train_features, train_labels)
-    rf_model = build_random_forest_model(train_features, train_labels)
-    gb_model = build_gradient_boosting_model(train_features, train_labels)
+    # Build features
+    vectorizer, X_train, y_train = build_vectorizer_and_features(train_ds)
+    X_val, y_val = transform_features(val_ds, vectorizer)
+    X_test, y_test = transform_features(test_ds, vectorizer)
 
-    test_model(logistic_model, test_features, test_labels)
-    test_model(rf_model, test_features, test_labels)
-    test_model(gb_model, test_features, test_labels)
+    # Train
+    lr = build_logistic(X_train, y_train)
+    rf = build_rf(X_train, y_train)
+    xg = build_xgb(X_train, y_train)
+
+    # Validate
+    test_model("LR (val)", lr, X_val, y_val)
+    test_model("RF (val)", rf, X_val, y_val)
+    test_model("XGB (val)", xg, X_val, y_val)
+
+    # Ensemble
+    ensemble = VotingClassifier(
+        estimators=[("lr", lr), ("rf", rf), ("xg", xg)], voting="hard", n_jobs=-1
+    )
+    ensemble.fit(X_train, y_train)
+    test_model("Ensemble (val)", ensemble, X_val, y_val)
+
+    # Final test
+    test_model("Ensemble (test)", ensemble, X_test, y_test)
+
+    # Save vectorizer and models
+    dump(vectorizer, "./data/models/vectorizer.joblib")
+    dump(lr, "./data/models/logistic.joblib")
+    dump(rf, "./data/models/random_forest.joblib")
+    dump(xg, "./data/models/xgboost.joblib")
+    dump(ensemble, "./data/models/ensemble.joblib")
+    print("All models and vectorizer saved.")
 
 
 if __name__ == "__main__":
