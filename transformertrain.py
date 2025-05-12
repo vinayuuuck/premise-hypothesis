@@ -7,11 +7,9 @@ from transformers import (
 )
 import evaluate
 
-# 1. Load and filter SNLI
 snli = load_dataset("snli")
 snli = snli.filter(lambda ex: ex["label"] != -1)
 
-# 2. Tokenizer & Preprocessing
 tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
 
 
@@ -27,16 +25,13 @@ def preprocess(examples):
 
 snli = snli.map(preprocess, batched=True)
 
-# 3. Format for PyTorch
 snli.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
 
-# 4. Load DistilBERT for 3-way classification
 model = AutoModelForSequenceClassification.from_pretrained(
     "distilbert-base-uncased",
     num_labels=3,
 )
 
-# 5. TrainingArguments with fp16 for speed
 training_args = TrainingArguments(
     output_dir="./distilbert-snli",
     eval_strategy="epoch",  # or eval_strategy="steps"
@@ -50,7 +45,6 @@ training_args = TrainingArguments(
     save_strategy="epoch",
 )
 
-# 6. Metrics
 metric = evaluate.load("accuracy")
 
 
@@ -60,7 +54,6 @@ def compute_metrics(eval_pred):
     return metric.compute(predictions=preds, references=labels)
 
 
-# 7. Trainer
 trainer = Trainer(
     model=model,
     args=training_args,
@@ -69,7 +62,6 @@ trainer = Trainer(
     compute_metrics=compute_metrics,
 )
 
-# 8. Train & Evaluate
 trainer.train()
 results = trainer.evaluate(snli["test"])
 print("Test results:", results)

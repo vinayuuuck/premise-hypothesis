@@ -3,9 +3,9 @@ import pandas as pd
 import tensorflow as tf
 from sklearn.model_selection import train_test_split
 from datasets import load_dataset
+import matplotlib.pyplot as plt
 
 
-# Load GloVe embeddings
 def load_glove_embeddings(glove_file):
     embeddings = {}
     with open(glove_file, "r", encoding="utf-8") as f:
@@ -71,19 +71,16 @@ def combine(premise, hypothesis, embeddings_index, embedding_dim):
 
 
 def train_model():
-    # Load GloVe embeddings
     glove_file = "./data/glove.840B.300d.txt"
     embeddings_index = load_glove_embeddings(glove_file)
     embedding_dim = 300
     print(f"Loaded {len(embeddings_index)} word vectors.")
 
-    # Create a tokenizer
     tokenizer = tf.keras.preprocessing.text.Tokenizer()
     tokenizer.fit_on_texts(embeddings_index.keys())
     word_index = tokenizer.word_index
     print(f"Found {len(word_index)} unique tokens.")
 
-    # Build the training data
     snli = load_dataset("snli")
     snli = snli.filter(lambda x: x["label"] != "-1")
     X_train = snli["train"]
@@ -105,13 +102,11 @@ def train_model():
         ]
     )
 
-    # Convert labels to one-hot encoding
     num_classes = 3
     y_train_one_hot = tf.keras.utils.to_categorical(y_train, num_classes)
     y_val_one_hot = tf.keras.utils.to_categorical(y_val, num_classes)
     print("Labels converted to one-hot encoding.")
 
-    # Define the model
     inputs = tf.keras.layers.Input(shape=(X_train_embeddings.shape[1],))
     x = tf.keras.layers.Dense(
         512,
@@ -125,7 +120,6 @@ def train_model():
     # x = tf.keras.layers.Dropout(0.5)(x)
     outputs = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
 
-    # Create the model
     model = tf.keras.Model(inputs=inputs, outputs=outputs)
     model.compile(
         optimizer=tf.keras.optimizers.Adam(),
@@ -133,7 +127,6 @@ def train_model():
         metrics=["accuracy"],
     )
 
-    # Train the model
     history = model.fit(
         X_train_embeddings,
         y_train_one_hot,
@@ -143,7 +136,6 @@ def train_model():
     )
     print("Model trained.")
 
-    # Evaluate the model
     test_embeddings = np.array(
         [
             combine(s["premise"], s["hypothesis"], embeddings_index, embedding_dim)
@@ -157,7 +149,6 @@ def train_model():
     print(f"Test loss: {test_loss}")
     print(f"Test accuracy: {test_accuracy}")
 
-    # Save the model
     model.save("./data/models/sentence_model.h5")
     print("Model saved.")
 
@@ -166,6 +157,34 @@ def train_model():
 
 def main():
     model, history = train_model()
+
+    train_loss = history.history["loss"]
+    val_loss = history.history["val_loss"]
+    train_acc = history.history["accuracy"]
+    val_acc = history.history["val_accuracy"]
+    epochs = range(1, len(train_loss) + 1)
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(epochs, train_loss, label="Train Loss")
+    plt.plot(epochs, val_loss, label="Val Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training vs. Validation Loss")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("./data/models/glove_mlp_loss.png", dpi=300, bbox_inches="tight")
+    # plt.show()
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(epochs, train_acc, label="Train Accuracy")
+    plt.plot(epochs, val_acc, label="Val Accuracy")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.title("Training vs. Validation Accuracy")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("./data/models/glove_mlp_accuracy.png", dpi=300, bbox_inches="tight")
+    # plt.show()
 
 
 if __name__ == "__main__":
